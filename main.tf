@@ -3,26 +3,6 @@ provider "aws" {
   version = "~> 1.0"
 }
 
-variable "aws_region" {
-  default = "ap-southeast-1"
-}
-
-variable "domain" {
-  type = "string"
-}
-
-variable "internal_vpc_cidr" {
-  default = "10.98.0.0/16"
-}
-
-variable "internal_vpc_sn_cidr" {
-  default = "10.98.1.0/24"
-}
-
-variable "key_name" {
-  type = "string"
-}
-
 data "aws_ami" "ubuntu" {
   most_recent = true
 
@@ -39,43 +19,60 @@ data "aws_ami" "ubuntu" {
   owners = ["099720109477"]
 }
 
-data "aws_route53_zone" "public_zone" {
+# Primary hosted zone
+data "aws_route53_zone" "public" {
   name         = "${var.domain}"
   private_zone = false
 }
 
+# Zone for a subdomain
+resource "aws_route53_zone" "foo" {
+  name = "foo.${var.domain}"
+}
+
+# Delegates queries from primary zone to the zone for foo.<domain>
+resource "aws_route53_record" "foo_delegation" {
+  zone_id = "${data.aws_route53_zone.public.zone_id}"
+  name    = "foo.${var.domain}"
+  type    = "NS"
+  ttl     = "86400"
+  records = ["${aws_route53_zone.foo.name_servers}"]
+}
+
+# Internal hosted zone, associated with the VPC
 resource "aws_route53_zone" "internal_zone" {
   name   = "internal.${var.domain}"
   vpc_id = "${aws_vpc.internal_vpc.id}"
 }
 
-// this record will be resolved via the public DNS zone
+# This record will be resolved via the public DNS zone - my-host.foo.<domain>
 resource "aws_route53_record" "public_record" {
-  zone_id = "${data.aws_route53_zone.public_zone.zone_id}"
-  name    = "foo"
+  zone_id = "${aws_route53_zone.foo.zone_id}"
+  name    = "webserver"
   type    = "A"
   ttl     = "300"
   records = ["1.2.3.4"]
 }
 
-// this records won't be visible inside the VPC since it's masked and R53 won't delegate
+# This record will not be visible inside the VPC - it is masked by the internal zone
 resource "aws_route53_record" "masked_record" {
-  zone_id = "${data.aws_route53_zone.public_zone.zone_id}"
-  name    = "bar.internal"
+  zone_id = "${data.aws_route53_zone.public.zone_id}"
+  name    = "some-host.internal"
   type    = "A"
   ttl     = "300"
   records = ["1.2.3.5"]
 }
 
-// this record will be resolved via the private hosted zone
+# This record will be resolved via the private hosted zone
 resource "aws_route53_record" "internal_record" {
   zone_id = "${aws_route53_zone.internal_zone.zone_id}"
-  name    = "foo"
+  name    = "some-db"
   type    = "A"
   ttl     = "300"
   records = ["10.0.0.1"]
 }
 
+# VPC, subnet, etc. resources for testing
 resource "aws_vpc" "internal_vpc" {
   cidr_block = "${var.internal_vpc_cidr}"
 
@@ -92,13 +89,28 @@ resource "aws_subnet" "internal_vpc_sn" {
   cidr_block = "${var.internal_vpc_sn_cidr}"
 }
 
-# resource "aws_route53_zone_association" "internal_vpc_assoc" {
-#   zone_id = "${aws_route53_zone.internal_zone.zone_id}"
-#   vpc_id  = "${aws_vpc.internal_vpc.id}"
-# }
-
 resource "aws_internet_gateway" "igw" {
   vpc_id = "${aws_vpc.internal_vpc.id}"
+}
+
+resource "aws_route" "igw_route" {
+  route_table_id         = "${aws_vpc.internal_vpc.default_route_table_id}"
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = "${aws_internet_gateway.igw.id}"
+}
+
+# Test instance to test name resolution inside the VPC
+resource "aws_instance" "hello" {
+  ami                         = "${data.aws_ami.ubuntu.id}"
+  key_name                    = "${var.key_name}"
+  instance_type               = "t2.micro"
+  subnet_id                   = "${aws_subnet.internal_vpc_sn.id}"
+  associate_public_ip_address = true
+  vpc_security_group_ids      = ["${aws_security_group.allow_ssh.id}"]
+
+  tags = {
+    Name = "route53-demo"
+  }
 }
 
 resource "aws_security_group" "allow_ssh" {
@@ -119,31 +131,4 @@ resource "aws_security_group" "allow_ssh" {
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
-}
-
-resource "aws_instance" "hello" {
-  ami                         = "${data.aws_ami.ubuntu.id}"
-  key_name                    = "${var.key_name}"
-  instance_type               = "t2.micro"
-  subnet_id                   = "${aws_subnet.internal_vpc_sn.id}"
-  associate_public_ip_address = true
-  vpc_security_group_ids      = ["${aws_security_group.allow_ssh.id}"]
-
-  tags = {
-    Name = "route53-demo"
-  }
-}
-
-resource "aws_route" "igw_route" {
-  route_table_id         = "${aws_vpc.internal_vpc.default_route_table_id}"
-  destination_cidr_block = "0.0.0.0/0"
-  gateway_id             = "${aws_internet_gateway.igw.id}"
-}
-
-output "public_dns" {
-  value = "${aws_instance.hello.public_dns}"
-}
-
-output "public_ip" {
-  value = "${aws_instance.hello.public_ip}"
 }
